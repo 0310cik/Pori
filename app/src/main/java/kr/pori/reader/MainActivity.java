@@ -26,7 +26,7 @@ public class MainActivity extends ComponentActivity {
     private static final int PAPER=0xffF8F9F2, INK=0xff183E33, GREEN=0xff184F40, LIGHT=0xffE3ECD9, LIME=0xffD4F399;
     private static final String[] STEPS={
         "읽고 싶은 글을 휴대폰 카메라에 비춰 주세요.",
-        "손바닥과 검지가 함께 보이게 해 주세요. 읽고 싶은 줄 바로 아래를 가리키고 잠깐 멈춰 주세요.",
+        "검지 끝으로 읽을 줄 바로 아래를 가리켜 주세요. 손끝에 동그라미가 보이면 잠깐 멈춰 주세요.",
         "포리가 그 줄만 읽어 줘요. 화면에서 글줄을 눌러도 돼요. 끝까지 들은 글은 ‘읽은 글’에 저장돼요."
     };
     private enum Page { GUIDE, PERMISSION, READER, HISTORY }
@@ -192,7 +192,7 @@ public class MainActivity extends ComponentActivity {
         LinearLayout indicators = new LinearLayout(this);
         indicators.setGravity(Gravity.CENTER_VERTICAL);
         add(panel, indicators, 3);
-        handStatus = label("손가락을 찾는 중",17,true);
+        handStatus = label("검지 끝 찾는 중",17,true);
         indicators.addView(handStatus,new LinearLayout.LayoutParams(0,-2,1));
         Switch marker = new Switch(this);
         marker.setText("손끝 표시");
@@ -231,12 +231,13 @@ public class MainActivity extends ComponentActivity {
             public void hand(FrameReader.Hand hand, OutputTransform source, long capturedAt) {
                 latestHand = hand;
                 pointing.hand(hand.tip, capturedAt);
-                overlay.hand(hand.tip, source);
+                overlay.hand(hand, source);
                 String message;
                 switch (hand.state) {
-                    case FOUND: message = "검지 끝 인식됨"; break;
-                    case UNAVAILABLE: message = "손 인식 사용 불가"; break;
-                    default: message = "손가락을 찾는 중";
+                    case LANDMARKS: message = "검지 끝 인식됨"; break;
+                    case CONTOUR: message = "손끝 윤곽 인식됨"; break;
+                    case CONTOUR_ONLY: message = "손끝 윤곽을 찾는 중"; break;
+                    default: message = "검지 끝 찾는 중";
                 }
                 setLabel(handStatus, message);
             }
@@ -314,7 +315,6 @@ public class MainActivity extends ComponentActivity {
 
         boolean speaking = voice.state == Voice.State.PLAYING || voice.state == Voice.State.PAUSED;
         FrameReader.Line visible = speaking && now - selectedSeen <= 650 ? selected : point;
-        if (visible == null) visible = match;
         overlay.line(visible, source);
         readerStatus();
     }
@@ -330,8 +330,8 @@ public class MainActivity extends ComponentActivity {
         else if (frame == null) message = "카메라를 준비하고 있어요.";
         else if (!frame.ocrAvailable) message = "글자 인식을 다시 시도하고 있어요.";
         else if (frame.lines.isEmpty()) message = "글자를 찾는 중이에요. 글이 선명하게 보이도록 비춰 주세요.";
-        else if (latestHand == null || latestHand.tip == null) message = "손바닥과 검지를 함께 비추거나 글줄을 눌러 주세요.";
-        else if (point == null) message = "손끝 가까이에 글이 없어요. 줄 바로 아래를 가리켜 주세요.";
+        else if (latestHand == null || latestHand.tip == null) message = "검지 끝을 글 가까이에 두거나 화면에서 글줄을 눌러 주세요.";
+        else if (point == null) message = "손끝 근처의 글줄을 찾는 중이에요. 읽을 줄 바로 아래를 가리켜 주세요.";
         else if (voice.state == Voice.State.STARTING) message = "한국어 음성을 준비하고 있어요.";
         else if (point.tracks(selected)) message = "다른 줄을 가리키거나 다시 들을 수 있어요.";
         else message = "그 줄에서 손끝을 잠깐 멈춰 주세요.";

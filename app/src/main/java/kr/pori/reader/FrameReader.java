@@ -72,12 +72,18 @@ final class FrameReader {
         }
     }
 
-    enum HandState { FOUND, SEARCHING, UNAVAILABLE }
+    enum HandState { LANDMARKS, CONTOUR, SEARCHING, CONTOUR_ONLY }
 
     static final class Hand {
-        final PointF tip;
+        final PointF tip, joint;
+        final float[] outline;
         final HandState state;
-        Hand(PointF tip, HandState state) { this.tip = tip; this.state = state; }
+        Hand(HandState state, PointF tip, PointF joint, float[] outline) {
+            this.state = state;
+            this.tip = tip;
+            this.joint = joint;
+            this.outline = outline;
+        }
     }
 
     static final class Frame {
@@ -93,12 +99,18 @@ final class FrameReader {
         }
 
         Line nearest(float x, float y, boolean finger) {
-            Line best = null;
-            float shortest = Float.POSITIVE_INFINITY;
+            Line best = null, second = null;
+            float shortest = Float.POSITIVE_INFINITY, next = Float.POSITIVE_INFINITY;
             for (Line line : lines) {
                 float distance = line.distance(x, y, finger);
-                if (distance < shortest) { shortest = distance; best = line; }
+                if (distance < shortest) {
+                    second = best; next = shortest;
+                    best = line; shortest = distance;
+                } else if (distance < next) {
+                    second = line; next = distance;
+                }
             }
+            if (finger && second != null && next - shortest < .18f * Math.min(best.height, second.height)) return null;
             return best;
         }
 
@@ -119,10 +131,28 @@ final class FrameReader {
     private boolean triedHands;
     private HandLandmarker hands;
     private TextRecognizer text;
+    private final PartialTipDetector contours = new PartialTipDetector();
+    private int[] colorPixels;
 
     FrameReader(Context context) { this.context = context.getApplicationContext(); }
 
     Hand hand(Bitmap upright, long timestampMs) {
+        Hand model = modelHand(upright, timestampMs);
+        if (model != null) {
+            contours.forget();
+            return model;
+        }
+        int w = upright.getWidth(), h = upright.getHeight();
+        if (colorPixels == null || colorPixels.length != w * h) colorPixels = new int[w * h];
+        upright.getPixels(colorPixels, 0, w, 0, 0, w, h);
+        PartialTipDetector.Tip contour = contours.detect(colorPixels, w, h, timestampMs);
+        if (contour != null) {
+            return new Hand(HandState.CONTOUR, new PointF(contour.x, contour.y), null, contour.outline);
+        }
+        return new Hand(hands == null ? HandState.CONTOUR_ONLY : HandState.SEARCHING, null, null, null);
+    }
+
+    private Hand modelHand(Bitmap upright, long timestampMs) {
         try {
             if (!triedHands) {
                 triedHands = true;
@@ -131,7 +161,7 @@ final class FrameReader {
                                 .setBaseOptions(BaseOptions.builder().setModelAssetPath("hand_landmarker.task").build())
                                 .setRunningMode(RunningMode.VIDEO).setNumHands(1).build());
             }
-            if (hands == null) return new Hand(null, HandState.UNAVAILABLE);
+            if (hands == null) return null;
             // MPImage.close recycles its backing bitmap. OCR keeps its own full-resolution input.
             int w = upright.getWidth(), h = upright.getHeight();
             float scale = Math.min(1f, 640f / Math.max(w, h));
@@ -142,15 +172,23 @@ final class FrameReader {
                 var found = hands.detectForVideo(image, timestampMs).landmarks();
                 if (!found.isEmpty() && found.get(0).size() > HandLandmark.INDEX_FINGER_TIP) {
                     var tip = found.get(0).get(HandLandmark.INDEX_FINGER_TIP);
-                    return new Hand(new PointF(tip.x() * w, tip.y() * h), HandState.FOUND);
+                    var joint = found.get(0).get(HandLandmark.INDEX_FINGER_DIP);
+                    PointF point = inFrame(tip.x(), tip.y(), w, h);
+                    if (point != null) {
+                        return new Hand(HandState.LANDMARKS, point, inFrame(joint.x(), joint.y(), w, h), null);
+                    }
                 }
             } finally {
                 if (!small.isRecycled()) small.recycle();
             }
-            return new Hand(null, HandState.SEARCHING);
         } catch (RuntimeException | LinkageError e) {
-            return new Hand(null, HandState.UNAVAILABLE);
+            // A failed model must not interrupt the independent contour or OCR paths.
         }
+        return null;
+    }
+
+    private static PointF inFrame(float x, float y, int width, int height) {
+        return x >= 0 && x < 1 && y >= 0 && y < 1 ? new PointF(x * width, y * height) : null;
     }
 
     Frame readLines(Bitmap upright, Hand hand, long capturedAt) {
@@ -176,6 +214,6 @@ final class FrameReader {
         return new Frame(java.util.Collections.emptyList(), hand, capturedAt, false);
     }
 
-    void closeHands() { if (hands != null) hands.close(); }
+    void closeHands() { colorPixels = null; if (hands != null) hands.close(); }
     void closeText() { if (text != null) text.close(); }
 }
