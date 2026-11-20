@@ -96,7 +96,7 @@ final class ReaderOverlay extends View {
             pen.setColor(0xff183E33);
             canvas.drawCircle(point[0], point[1], 9 * density, pen);
             pen.setStrokeWidth(2.5f * density);
-            pen.setColor(0xffD4F399);
+            pen.setColor(hand.state == FrameReader.HandState.TRACKED ? 0xffFFD38A : 0xffD4F399);
             canvas.drawCircle(point[0], point[1], 9 * density, pen);
             pen.setStyle(Paint.Style.FILL);
             canvas.drawCircle(point[0], point[1], 2.5f * density, pen);

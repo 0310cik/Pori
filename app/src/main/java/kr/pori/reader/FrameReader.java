@@ -72,7 +72,7 @@ final class FrameReader {
         }
     }
 
-    enum HandState { LANDMARKS, CONTOUR, SEARCHING, CONTOUR_ONLY }
+    enum HandState { LANDMARKS, CONTOUR, TRACKED, SEARCHING, CONTOUR_ONLY }
 
     static final class Hand {
         final PointF tip, joint;
@@ -88,12 +88,10 @@ final class FrameReader {
 
     static final class Frame {
         final List<Line> lines;
-        final Hand hand;
         final long capturedAt;
         final boolean ocrAvailable;
-        Frame(List<Line> lines, Hand hand, long capturedAt, boolean ocrAvailable) {
+        Frame(List<Line> lines, long capturedAt, boolean ocrAvailable) {
             this.lines = lines;
-            this.hand = hand;
             this.capturedAt = capturedAt;
             this.ocrAvailable = ocrAvailable;
         }
@@ -133,23 +131,40 @@ final class FrameReader {
     private TextRecognizer text;
     private final PartialTipDetector contours = new PartialTipDetector();
     private int[] colorPixels;
+    private long lastProbe = -1;
+    private boolean followingModel;
 
     FrameReader(Context context) { this.context = context.getApplicationContext(); }
 
     Hand hand(Bitmap upright, long timestampMs) {
-        Hand model = modelHand(upright, timestampMs);
-        if (model != null) {
-            contours.forget();
-            return model;
+        // Follow a known full hand at camera cadence. A missing palm needs only occasional
+        // probes while the contour detector measures the visible end in every accepted frame.
+        boolean probeFirst = followingModel || lastProbe < 0;
+        if (probeFirst) {
+            Hand model = probeModel(upright, timestampMs);
+            if (model != null) return model;
         }
         int w = upright.getWidth(), h = upright.getHeight();
         if (colorPixels == null || colorPixels.length != w * h) colorPixels = new int[w * h];
         upright.getPixels(colorPixels, 0, w, 0, 0, w, h);
         PartialTipDetector.Tip contour = contours.detect(colorPixels, w, h, timestampMs);
+        if (!probeFirst && timestampMs - lastProbe >= (contour == null ? 175 : 500)) {
+            Hand model = probeModel(upright, timestampMs);
+            if (model != null) return model;
+        }
         if (contour != null) {
-            return new Hand(HandState.CONTOUR, new PointF(contour.x, contour.y), null, contour.outline);
+            HandState state = contour.outline == null ? HandState.TRACKED : HandState.CONTOUR;
+            return new Hand(state, new PointF(contour.x, contour.y), null, contour.outline);
         }
         return new Hand(hands == null ? HandState.CONTOUR_ONLY : HandState.SEARCHING, null, null, null);
+    }
+
+    private Hand probeModel(Bitmap upright, long timestampMs) {
+        lastProbe = timestampMs;
+        Hand model = modelHand(upright, timestampMs);
+        followingModel = model != null;
+        if (followingModel) contours.forget();
+        return model;
     }
 
     private Hand modelHand(Bitmap upright, long timestampMs) {
@@ -174,8 +189,9 @@ final class FrameReader {
                     var tip = found.get(0).get(HandLandmark.INDEX_FINGER_TIP);
                     var joint = found.get(0).get(HandLandmark.INDEX_FINGER_DIP);
                     PointF point = inFrame(tip.x(), tip.y(), w, h);
-                    if (point != null) {
-                        return new Hand(HandState.LANDMARKS, point, inFrame(joint.x(), joint.y(), w, h), null);
+                    if (point != null && tip.visibility().orElse(1f) >= .5f && tip.presence().orElse(1f) >= .5f) {
+                        return new Hand(HandState.LANDMARKS, point, joint.visibility().orElse(0f) >= .5f
+                                ? inFrame(joint.x(), joint.y(), w, h) : null, null);
                     }
                 }
             } finally {
@@ -191,7 +207,7 @@ final class FrameReader {
         return x >= 0 && x < 1 && y >= 0 && y < 1 ? new PointF(x * width, y * height) : null;
     }
 
-    Frame readLines(Bitmap upright, Hand hand, long capturedAt) {
+    Frame readLines(Bitmap upright, long capturedAt) {
         List<Line> lines = new ArrayList<>();
         try {
             if (text == null) text = TextRecognition.getClient(new KoreanTextRecognizerOptions.Builder().build());
@@ -205,13 +221,13 @@ final class FrameReader {
                     }
                 }
             }
-            return new Frame(lines, hand, capturedAt, true);
+            return new Frame(lines, capturedAt, true);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } catch (java.util.concurrent.ExecutionException | RuntimeException | LinkageError e) {
             // Report this stage on screen. Neither camera data nor recognized text goes into logs.
         }
-        return new Frame(java.util.Collections.emptyList(), hand, capturedAt, false);
+        return new Frame(java.util.Collections.emptyList(), capturedAt, false);
     }
 
     void closeHands() { colorPixels = null; if (hands != null) hands.close(); }

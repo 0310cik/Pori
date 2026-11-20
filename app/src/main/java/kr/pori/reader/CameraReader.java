@@ -28,6 +28,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 final class CameraReader {
     interface Listener {
@@ -36,7 +37,7 @@ final class CameraReader {
         void error(String message);
     }
 
-    private static final long HAND_INTERVAL_MS = 75, OCR_INTERVAL_MS = 220;
+    private static final long HAND_INTERVAL_MS = 32, OCR_INTERVAL_MS = 220;
     private final ComponentActivity activity;
     private final PreviewView view;
     private final Listener listener;
@@ -123,6 +124,7 @@ final class CameraReader {
 
     private void analyze(ImageProxy image) {
         Bitmap pixels = null;
+        AtomicInteger owners = new AtomicInteger(1);
         try {
             long stamp = TimeUnit.NANOSECONDS.toMillis(image.getImageInfo().getTimestamp());
             if (closed || (lastHand >= 0 && stamp - lastHand < HAND_INTERVAL_MS)) return;
@@ -130,29 +132,41 @@ final class CameraReader {
             long capturedAt = SystemClock.elapsedRealtime();
             OutputTransform source = transformFactory.getOutputTransform(image);
             pixels = uprightPixels(image);
-            FrameReader.Hand hand = reader.hand(pixels, stamp);
-            post(() -> listener.hand(hand, source, capturedAt));
 
             if (!closed && (lastOcr < 0 || stamp - lastOcr >= OCR_INTERVAL_MS)
                     && readingText.compareAndSet(false, true)) {
                 lastOcr = stamp;
                 Bitmap owned = pixels;
-                ocrWorker.execute(() -> {
-                    try {
-                        if (closed) return;
-                        FrameReader.Frame frame = reader.readLines(owned, hand, capturedAt);
-                        post(() -> listener.frame(frame, source));
-                    } finally {
-                        owned.recycle();
-                        readingText.set(false);
-                    }
-                });
-                pixels = null; // The OCR worker owns these pixels until ML Kit completes.
+                owners.incrementAndGet();
+                try {
+                    ocrWorker.execute(() -> {
+                        try {
+                            if (!closed) {
+                                FrameReader.Frame frame = reader.readLines(owned, capturedAt);
+                                post(() -> listener.frame(frame, source));
+                            }
+                        } finally {
+                            if (owners.decrementAndGet() == 0) owned.recycle();
+                            readingText.set(false);
+                        }
+                    });
+                } catch (java.util.concurrent.RejectedExecutionException e) {
+                    owners.decrementAndGet();
+                    readingText.set(false);
+                }
             }
+            FrameReader.Hand result;
+            try {
+                result = reader.hand(pixels, stamp);
+            } catch (RuntimeException | LinkageError e) {
+                result = new FrameReader.Hand(FrameReader.HandState.SEARCHING, null, null, null);
+            }
+            FrameReader.Hand hand = result;
+            post(() -> listener.hand(hand, source, capturedAt));
         } catch (RuntimeException | LinkageError e) {
             post(() -> listener.error("카메라 영상을 분석하지 못했어요. 다음 화면을 확인하고 있어요."));
         } finally {
-            if (pixels != null) pixels.recycle();
+            if (pixels != null && owners.decrementAndGet() == 0) pixels.recycle();
             image.close();
         }
     }

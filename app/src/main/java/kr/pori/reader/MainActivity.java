@@ -45,7 +45,11 @@ public class MainActivity extends ComponentActivity {
     private FrameReader.Line selected, point;
     private OutputTransform frameSource;
     private PointingSelection pointing;
-    private long selectedSeen;
+    private static final long HAND_MAX_AGE = 300, OCR_AUTO_MAX_AGE = 1500;
+    private final java.util.HashMap<Long, FrameReader.Hand> handSamples = new java.util.HashMap<>();
+    private long selectedSeen, lastHandAt = -1, lastLossAt = -1;
+    private boolean selectedByTouch;
+    private final Runnable expireHand = this::hideStaleHand;
     private boolean selectionSaved;
     private String lastText = "", cameraError;
     private ReadingHistory history;
@@ -229,21 +233,36 @@ public class MainActivity extends ComponentActivity {
         cameraError = null;
         camera = new CameraReader(this, preview, new CameraReader.Listener() {
             public void hand(FrameReader.Hand hand, OutputTransform source, long capturedAt) {
+                long now = SystemClock.elapsedRealtime();
+                if (capturedAt <= lastHandAt || now - capturedAt >= HAND_MAX_AGE) return;
+                lastHandAt = capturedAt;
+                handSamples.keySet().removeIf(t -> now - t > OCR_AUTO_MAX_AGE);
+                handSamples.put(capturedAt, hand);
                 latestHand = hand;
                 pointing.hand(hand.tip, capturedAt);
                 overlay.hand(hand, source);
+                overlay.removeCallbacks(expireHand);
+                if (hand.tip != null) overlay.postDelayed(expireHand, HAND_MAX_AGE - (now - capturedAt));
                 String message;
                 switch (hand.state) {
                     case LANDMARKS: message = "검지 끝 인식됨"; break;
                     case CONTOUR: message = "손끝 윤곽 인식됨"; break;
-                    case CONTOUR_ONLY: message = "손끝 윤곽을 찾는 중"; break;
+                    case TRACKED: message = "손끝 움직임 추적 중"; break;
+                    case CONTOUR_ONLY: message = "검지 끝 찾는 중 · 윤곽 감지"; break;
                     default: message = "검지 끝 찾는 중";
                 }
                 setLabel(handStatus, message);
+                if (frame != null && frame.capturedAt == capturedAt) evaluatePoint();
+                else if (point != null && (hand.tip == null || frame == null
+                        || frame.nearest(hand.tip.x, hand.tip.y, true) != point)) {
+                    pointing.stable(null, capturedAt);
+                    clearPoint();
+                }
             }
             public void frame(FrameReader.Frame value, OutputTransform source) { update(value, source); }
             public void error(String message) {
                 frame = null; point = null; latestHand = null; cameraError = message;
+                handSamples.clear(); overlay.removeCallbacks(expireHand);
                 pointing.stable(null, SystemClock.elapsedRealtime());
                 overlay.line(null, null); overlay.hand(null, null);
                 setLabel(handStatus, "손가락 영상을 기다리는 중");
@@ -253,7 +272,26 @@ public class MainActivity extends ComponentActivity {
         camera.start();
     }
 
+    private void clearPoint() {
+        point = null;
+        if (voice.state != Voice.State.PLAYING && voice.state != Voice.State.PAUSED) overlay.line(null, frameSource);
+        readerStatus();
+    }
+
+    private void hideStaleHand() {
+        latestHand = null;
+        lastLossAt = SystemClock.elapsedRealtime();
+        pointing.hand(null, SystemClock.elapsedRealtime());
+        overlay.hand(null, null);
+        setLabel(handStatus, "검지 끝 찾는 중");
+        clearPoint();
+    }
+
     private void endCamera() {
+        if (overlay != null) overlay.removeCallbacks(expireHand);
+        lastHandAt = -1;
+        lastLossAt = -1;
+        handSamples.clear();
         if (camera != null) { camera.close(); camera = null; }
         frame = null; frameSource = null; point = null; latestHand = null;
         if (overlay != null) { overlay.line(null, null); overlay.hand(null, null); }
@@ -270,10 +308,11 @@ public class MainActivity extends ComponentActivity {
         }
         FrameReader.Line line = frame.nearest(x, y, false);
         if (line == null) { setLabel(status, "읽고 싶은 글줄 위를 눌러 주세요."); return; }
-        choose(line);
+        choose(line, true);
     }
 
-    private void choose(FrameReader.Line line) {
+    private void choose(FrameReader.Line line, boolean touch) {
+        selectedByTouch = touch;
         pointing.select(line);
         selected = line;
         selectedSeen = SystemClock.elapsedRealtime();
@@ -304,18 +343,48 @@ public class MainActivity extends ComponentActivity {
         FrameReader.Line match = frame.match(selected);
         if (match != null) { selected = match; selectedSeen = now; }
 
-        point = null;
-        if (value.hand.tip != null && latestHand != null && latestHand.tip != null
-                && now - value.capturedAt < 2000) {
-            point = value.nearest(value.hand.tip.x, value.hand.tip.y, true);
-            // A completed OCR result must still agree with the user's current fingertip.
-            if (point != null && value.nearest(latestHand.tip.x, latestHand.tip.y, true) != point) point = null;
+        // OCR may finish before or after the independent hand worker. Evaluate once
+        // its matching sample is known, and check that the latest hand still agrees.
+        if (value.capturedAt <= lastHandAt) evaluatePoint();
+        else {
+            point = null;
+            displaySelection(now);
         }
-        if (pointing.stable(point, value.capturedAt) && voice.state != Voice.State.PAUSED) choose(point);
+    }
 
+    private void evaluatePoint() {
+        long now = SystemClock.elapsedRealtime();
+        FrameReader.Hand atCapture = handSamples.get(frame.capturedAt);
+        point = null;
+        if (atCapture != null && atCapture.tip != null && latestHand != null && latestHand.tip != null
+                && now - frame.capturedAt <= OCR_AUTO_MAX_AGE && now - lastHandAt < HAND_MAX_AGE) {
+            point = frame.nearest(atCapture.tip.x, atCapture.tip.y, true);
+            // OCR can take over a second. Only use that older geometry if every
+            // intervening hand sample kept pointing at this row.
+            if (point != null && !heldThroughout(frame.capturedAt, point)) point = null;
+        }
+        // A patch can carry the marker over a short gap. Confirm a new utterance with a measured rim.
+        if (pointing.stable(point, frame.capturedAt) && point != null && latestHand.state != FrameReader.HandState.TRACKED
+                && atCapture.state != FrameReader.HandState.TRACKED && voice.state != Voice.State.PAUSED) {
+            choose(point, false);
+        }
+        displaySelection(now);
+    }
+
+    private boolean heldThroughout(long capturedAt, FrameReader.Line row) {
+        if (lastLossAt >= capturedAt) return false;
+        for (var sample : handSamples.entrySet()) {
+            if (sample.getKey() < capturedAt) continue;
+            var tip = sample.getValue().tip;
+            if (tip == null || frame.nearest(tip.x, tip.y, true) != row) return false;
+        }
+        return true;
+    }
+
+    private void displaySelection(long now) {
         boolean speaking = voice.state == Voice.State.PLAYING || voice.state == Voice.State.PAUSED;
         FrameReader.Line visible = speaking && now - selectedSeen <= 650 ? selected : point;
-        overlay.line(visible, source);
+        overlay.line(visible, frameSource);
         readerStatus();
     }
 
@@ -323,14 +392,14 @@ public class MainActivity extends ComponentActivity {
         if (page != Page.READER || status == null) return;
         String message;
         if (cameraError != null) message = cameraError;
-        else if (voice.state == Voice.State.PLAYING) message = "선택한 줄을 읽고 있어요.";
+        else if (voice.state == Voice.State.PLAYING) message = selectedByTouch ? "화면을 눌러 고른 줄을 읽고 있어요." : "손끝으로 고른 줄을 읽고 있어요.";
         else if (voice.state == Voice.State.PAUSED) message = "잠시 멈췄어요.";
         else if (voice.state == Voice.State.MISSING && !lastText.isEmpty()) message = "줄을 찾았어요. 한국어 음성을 준비해 주세요.";
         else if (voice.state == Voice.State.FAILED) message = "음성이 재생되지 않았어요. 다시 듣기를 눌러 주세요.";
-        else if (frame == null) message = "카메라를 준비하고 있어요.";
+        else if (frame == null) message = "글줄 찾는 중";
         else if (!frame.ocrAvailable) message = "글자 인식을 다시 시도하고 있어요.";
-        else if (frame.lines.isEmpty()) message = "글자를 찾는 중이에요. 글이 선명하게 보이도록 비춰 주세요.";
-        else if (latestHand == null || latestHand.tip == null) message = "검지 끝을 글 가까이에 두거나 화면에서 글줄을 눌러 주세요.";
+        else if (frame.lines.isEmpty()) message = "글줄을 찾지 못했어요. 글자가 크고 선명하게 보이도록 비춰 주세요.";
+        else if (latestHand == null || latestHand.tip == null) message = "글줄을 찾았어요. 손끝으로 가리키거나 화면에서 눌러 주세요.";
         else if (point == null) message = "손끝 근처의 글줄을 찾는 중이에요. 읽을 줄 바로 아래를 가리켜 주세요.";
         else if (voice.state == Voice.State.STARTING) message = "한국어 음성을 준비하고 있어요.";
         else if (point.tracks(selected)) message = "다른 줄을 가리키거나 다시 들을 수 있어요.";

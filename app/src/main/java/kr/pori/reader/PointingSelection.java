@@ -9,6 +9,9 @@ final class PointingSelection {
     private int samples;
 
     void hand(PointF tip, long now) {
+        if (candidate != null && (tip == null || !Float.isFinite(candidate.distance(tip.x, tip.y, true)))) {
+            stable(null, now);
+        }
         if (held == null) return;
         boolean away = tip == null || !Float.isFinite(held.distance(tip.x, tip.y, true));
         if (away) {
@@ -26,7 +29,7 @@ final class PointingSelection {
             return false;
         }
         // Ignore changes in OCR spelling/spacing when the physical row stays in place.
-        if (!line.tracks(candidate) || now - lastSample > 2000) {
+        if (!line.tracks(candidate) || now - lastSample > 1500) {
             samples = 0;
             since = now;
         }

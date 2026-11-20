@@ -57,6 +57,23 @@ public class PartialTipDetectorTest {
         assertNotNull(detector.detect(pixels, SIZE, SIZE, 2300));
     }
 
+    @Test public void findsShadedAchromaticTipWhenThePageOccludesItsBase() {
+        for (int background : new int[]{0xffeeeeee, 0xff151515}) {
+            int[] pixels = page();
+            finger(pixels, 90, 55);
+            for (int i = 0; i < pixels.length; i++) {
+                int shade = 118 + (i % SIZE - 90) * 2;
+                pixels[i] = pixels[i] == SKIN ? 0xff000000 | shade * 0x010101 : background;
+            }
+            var detector = new PartialTipDetector();
+            assertNull(detector.detect(pixels, SIZE, SIZE, 1000));
+            var tip = detector.detect(pixels, SIZE, SIZE, 1060);
+            assertNotNull(tip);
+            assertEquals(90, tip.x, 5);
+            assertEquals(55, tip.y, 3);
+        }
+    }
+
     @Test public void ambiguousFingersAndStraightEdgesDoNotStartTracking() {
         int[] both = page();
         finger(both, 55, 55);
